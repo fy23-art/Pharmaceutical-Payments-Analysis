@@ -1,0 +1,1181 @@
+---
+title: "Pharmaceutical Payments and Physician Prescribing Behavior in the United States"
+author: "Yiqian Wang, Jack Guan, Freya Yao"
+format:
+  pdf: default
+fontsize: 10pt
+geometry: margin=1in
+---
+
+# 1 Introduction
+
+The United States healthcare system is characterized by expenditures that significantly exceed those of other developed nations. In 2023, healthcare spending accounted for 17.6% of the US GDP$^{1}$, a proportion that is almost double of the OECD countries' average of around 9.2%$^{2}$. A notable component of this spending is attributed to prescription drugs, which represent a growing share of national health expenditures. Within this context, the financial relationships between pharmaceutical manufacturers and physicians have earned substantial attention. These relationships, which often involve payments for activities such as consulting, speaking engagements, and meals, are documented in the Centers for Medicare & Medicaid Services (CMS) Open Payments database.
+
+A prevailing hypothesis is that such financial transfers may influence physicians' prescribing behavior, potentially favoring more expensive brand-name drugs and thereby contributing to increased healthcare costs, particularly within public insurance programs like Medicare. Prior studies have documented associations between industry payments and physician behavior, but the strength and nature of these relationships remain debated. Some research suggests that even small-value items, such as meals, may affect prescribing decisions, while other studies emphasize the impact of larger payments such as consulting fees or honoraria.
+
+Understanding the dynamics of these interactions is particularly important for Medicare Part D, which provides prescription drug coverage to over 46 million beneficiaries. Since Part D represents one of the largest components of federal healthcare spending, any systematic influence of pharmaceutical payments on prescribing behavior has implications not only for cost efficiency but also for equity and patient welfare. Against this backdrop, this project seeks to empirically examine two central questions:
+
+\(1\) What is the relationship between the total monetary value of pharmaceutical payments physicians receive and the total cost of prescriptions they write?
+
+\(2\) How do different categories of payments—such as consulting fees, honoraria, or food and beverage—respectively affect prescribing behavior at the physician level?
+
+By linking physician-level Open Payments data with prescription activity under Medicare Part D, this study aims to shed light on the mechanisms through which financial incentives shape medical decision-making and, in turn, to inform ongoing policy debates on cost containment and ethical standards in healthcare. In this study, we specifically focus on how the pharmaceutical payments physicians receive affect the total cost of prescriptions they write, while including the number of unique patients attributed to the physician as a control variable to account for differences in patient load. We will also provide intuitive visualizations to facilitate understanding of the payments and prescriptions.
+
+# 2 Dataset Source and Description
+
+## 2.1 Primary Dataset: CMS Open Payments 2023
+
+**Source:** CMS Open Payments (https://openpaymentsdata.cms.gov/)
+
+The data originates from the CMS Open Payments program, a national transparency initiative mandated by the Affordable Care Act. It requires drug and medical device companies to systematically report all financial payments made to physicians and teaching hospitals. This information is collected directly from these companies, reviewed by the recipients, and then published publicly by CMS.
+
+**Content:** The dataset contains detailed records of financial transactions from pharmaceutical and medical device manufacturers to individual physicians and other entities. Each record documents the payment amount, payment type, date, and other contextual information such as the reporting company and the purpose of the payment.
+
+**Key variables:**
+
+-   *Total Payment Amount (numeric):* Dollar value of individual or aggregated transfers.
+
+-   *Recipient Type (categorical):* Indicates whether the payment recipient is an individual physician, hospital, or other entity. Only records with physicians are retained for analysis.
+
+-   *Payment Type (categorical):* Classification of transfer (e.g. consulting fees, food & beverage, travel, speaking honoraria).
+
+-   *Physician Identifier (NPI):* Unique identifier for each physician, enabling linkage with prescribing data.
+
+-   *Primary Specialty (categorical):* The main clinical specialty of the physician. This variable allows controlling for inherent differences in prescribing patterns across specialties.
+
+## 2.2 Secondary Dataset: Medicare Part D Prescribers by Provider 2023
+
+**Source:** CMS Medicare Part D Prescriber Public Use File (https://data.cms.gov/provider-summary-by-type-of-service/medicare-part-d-prescribers/medicare-part-d-prescribers-by-provider)
+
+**Content:** The dataset provides physician-level summaries of prescribing activity under Medicare Part D, which covers outpatient prescription drugs. It includes both the volume and the cost of prescriptions attributed to each physician.
+
+**Key variables:**
+
+-   *Prescription Count (numeric):* Total number of prescriptions filled under Part D.
+
+-   *Total Drug Cost (numeric):* Aggregate spending on prescribed medications.
+
+-   *Number of Beneficiaries (numeric):* Count of unique patients receiving prescriptions from the physician.
+
+-   *Physician Identifier (NPI):* Unique identifier for each physician; used to merge with the primary dataset.
+
+The source code for extracting and merging the datasets is outlined in the Appendix.
+
+```{r, echo=FALSE, results='hide', message=FALSE, warning=FALSE}
+
+library(data.table)
+library(stringr)
+library(DBI)
+library(RSQLite)
+
+con <- dbConnect(SQLite(), "data/STAT405_final_project.sqlite")
+
+dbExecute(con, "
+CREATE TEMP TABLE cleaned_payments AS
+SELECT
+    printf('%010s', TRIM(Covered_Recipient_NPI)) AS NPI,
+    CAST(Total_Amount_of_Payment_USDollars AS REAL) AS Total_Payment_Amount,
+    TRIM(
+        UPPER(SUBSTR(Nature_of_Payment_or_Transfer_of_Value,1,1)) ||
+        LOWER(SUBSTR(Nature_of_Payment_or_Transfer_of_Value,2))
+    ) AS Payment_Type,
+    Covered_Recipient_Type AS Recipient_Type,
+    TRIM(
+        CASE
+            WHEN INSTR(Covered_Recipient_Specialty_1, '|') = 0 THEN Covered_Recipient_Specialty_1
+            ELSE SUBSTR(
+                     Covered_Recipient_Specialty_1,
+                     LENGTH(Covered_Recipient_Specialty_1) - INSTR(REVERSE(Covered_Recipient_Specialty_1), '|') + 2
+                 )
+        END
+    ) AS Primary_Specialty
+FROM pharmaceutical_payment_table
+WHERE Covered_Recipient_NPI IS NOT NULL
+  AND Covered_Recipient_NPI != ''
+  AND Covered_Recipient_Type = 'Covered Recipient Physician'
+  AND Total_Amount_of_Payment_USDollars IS NOT NULL
+  AND Total_Amount_of_Payment_USDollars >= 0
+")
+
+```
+
+```{r, echo=FALSE, results='hide', message=FALSE, warning=FALSE}
+
+# Get all distinct payment types
+payment_types <- dbGetQuery(con, "SELECT DISTINCT Payment_Type FROM cleaned_payments")$Payment_Type
+
+# Build SUM(CASE...) for each payment type
+agg_sql <- paste(
+  sapply(payment_types, function(pt){
+    colname <- gsub("[^a-zA-Z0-9]", "_", pt)
+    sprintf("SUM(CASE WHEN Payment_Type = '%s' THEN Total_Payment_Amount ELSE 0 END) AS '%s'", pt, colname)
+  }),
+  collapse = ",\n    "
+)
+
+# Create doctor_level including Recipient_Type
+sql <- sprintf("
+CREATE TEMP TABLE doctor_level AS
+SELECT
+    NPI,
+    MAX(Recipient_Type) AS Recipient_Type,
+    MAX(Primary_Specialty) AS Primary_Specialty,
+    SUM(Total_Payment_Amount) AS Total_Payment,
+    %s
+FROM cleaned_payments
+GROUP BY NPI
+", agg_sql)
+
+dbExecute(con, "DROP TABLE IF EXISTS doctor_level;")
+dbExecute(con, sql)
+
+```
+
+```{r, echo=FALSE, results='hide', message=FALSE, warning=FALSE}
+
+# Clean secondary dataset
+dbExecute(con, "DROP TABLE IF EXISTS cleaned_prescribing;")
+dbExecute(con, "
+CREATE TEMP TABLE cleaned_prescribing AS
+SELECT
+    printf('%010s', TRIM(PRSCRBR_NPI)) AS NPI,
+    CAST(Tot_30day_Fills AS REAL) AS Prescription_Count,
+    CAST(Tot_Drug_Cst AS REAL) AS Total_Drug_Cost,
+    CAST(Tot_Benes AS REAL) AS Number_of_Beneficiaries
+FROM prescribing_behavior_table
+WHERE PRSCRBR_NPI IS NOT NULL
+  AND PRSCRBR_NPI != ''
+  AND Tot_30day_Fills IS NOT NULL
+  AND Tot_Drug_Cst IS NOT NULL
+  AND Tot_Benes IS NOT NULL
+")
+
+# Merge the two datasets
+dbExecute(con, "DROP TABLE IF EXISTS final_data;")
+dbExecute(con, "
+CREATE TABLE final_data AS
+SELECT 
+    d.*,
+    c.Prescription_Count,
+    c.Total_Drug_Cost,
+    c.Number_of_Beneficiaries
+FROM doctor_level d
+LEFT JOIN cleaned_prescribing c
+ON d.NPI = c.NPI
+")
+
+payments <- dbGetQuery(con, "
+  SELECT *
+  FROM cleaned_payments
+")
+final_data <- dbGetQuery(con, "
+  SELECT *
+  FROM final_data
+")
+
+```
+
+
+# 3 Payment Data Analysis
+
+## 3.1 Payment Distribution
+
+We first examine the empirical distribution of all individual payments from pharmaceutical and insurance companies to physicians. A frequency histogram including all payments under \$200 (covering over 90% of the dataset) is shown in Figure 1. Such truncation of the dataset is essential due to the existence of large outliers arising from large consulting fees and acquisitions. Table 1 displays the empirical quantiles of the payments and confirms the relevance of such outliers.
+
+```{r, echo=FALSE, fig.width=10, fig.height=6}
+
+hist(payments$Total_Payment_Amount[payments$Total_Payment_Amount <= 200],
+     breaks = 500,
+     col = "lightgreen",
+     xlab = "Payment Amount (USD)",
+     main = "Fig 1. Empirical Frequency Distribution of Individual Payment Amounts",
+     xlim = c(0, 200))
+
+```
+
+```{r, echo = FALSE, message=FALSE, warning=FALSE}
+
+# Calculate quantiles and convert to a data frame
+quant_df <- data.frame(
+  Quantile = names(quantile(payments$Total_Payment_Amount, probs = seq(0, 1, 0.1), na.rm = TRUE)),
+  Value = as.numeric(quantile(payments$Total_Payment_Amount, probs = seq(0, 1, 0.1), na.rm = TRUE))
+)
+
+# Display as a table
+knitr::kable(quant_df, caption = "Empirical Quantiles of Individual Payment Amounts")
+
+```
+
+The quantile analysis shows that over 80% of payments lie between 0–50 USD, while the largest individual payment reaches over 88 million USD. The histogram confirms that payments to physicians are significantly positively skewed even within the truncated range. In particular, individual payments most frequently occur around 20 USD but has a long tail across the full range. The high-peak, large-skewness, and leptokurtic nature of the payments calls into focus the effectiveness of small-value, high-frequency payments and large-value, lump-sum payments in potentially influencing prescribing behavior and the total cost of prescriptions under Medicare Part D.
+
+## 3.2 Payment Composition
+
+Having established that the overall distribution is highly skewed, we now seek to understand the distribution of individual payments that serve different purposes. Figure 2 shows four box plots, each of which describing the dispersion of individual payments for the four payment types with the highest total amount of processed payments. Outliers are removed to better depict the range of the payments and improve legibility. This allows us to study the range of distribution of the dominant payment types to better understand the financial interactions between physicians and pharmaceutical companies, which may influence prescribing patterns and the total cost of prescriptions under Medicare Part D.
+
+```{r, echo=FALSE, fig.width=10, fig.height=6}
+
+# Simplify overly long payment type names
+wrap_title_three <- function(text) {
+  if (grepl("Compensation for services other than consulting", text, ignore.case = TRUE)) {
+    return("Non-consulting compensation")
+  } else {
+    return(text)
+  }
+}
+
+# Step 1: Compute totals and order
+totals <- tapply(payments$Total_Payment_Amount,
+                 payments$Payment_Type,
+                 sum, na.rm = TRUE)
+top4_types <- names(sort(totals, decreasing = TRUE)[1:4])
+
+# Step 2: 2x2 panel layout
+par(mfrow = c(2,2), mar = c(5,5,3,1), oma = c(0, 0, 3, 0))
+
+# Step 3: Loop through top 4 payment types
+for (i in seq_along(top4_types)) {
+  ptype <- top4_types[i]
+  vals <- payments$Total_Payment_Amount[payments$Payment_Type == ptype]
+  
+  boxplot(vals,
+          horizontal = TRUE,
+          col = "orange",
+          main = "",
+          xlab = "Payment Amount (USD)",
+          outline = FALSE)
+  
+  if (i == 2) {
+    title(main = wrap_title_three(ptype))
+  } else {
+    title(main = ptype)
+  }
+}
+
+mtext("Fig 2: Distribution of Payments by Type (Top 4 Types by Total Amount Received)", outer = TRUE, cex = 1.5, font = 2, line = 1)
+
+```
+
+Consistent with the previous histogram, we observe heavy positive skewness in three of the plots (except Food and Beverage payments), which emphasizes the need for additional statistical treatments in our future analyses. It is interesting that Food and Beverage payments, which are relatively symmetric with a very small average value, appear among the four payment types with the largest total payments. The x-axes differ substantially across plots: Food and Beverage is on the order of \~10 USD per payment, Non-Consulting Compensation and Consulting Fees are on the \~1,000 USD scale, and Royalty or License Fees are on the \~10,000 USD scale. Thus, the prominence of smaller categories does not imply higher individual payments but reflects differences in both volume and scale.
+
+By comparing the relative ranges and medians of each payment type, we observe that Royalty or License Fees are the largest on a per-payment basis, Non-Consulting Compensation and Consulting Fees are also high, whereas Food and Beverage shows a high frequency of low-cost transactions, highlighting the large amount of potential pathways for financial incentives to affect physician behavior.
+
+To examine the distribution of the payments for the respective types in detail, we also study the distribution of the four payment types with the lowest total payments in the dataset. A violin plot is used for this purpose. Because some physicians receive extremely large payments, directly plotting raw values would compress most smaller payments near the bottom of the chart, making it difficult to observe their variation. To improve visibility, the y-axis is displayed on a logarithmic scale, which expands smaller values and compresses larger ones, allowing the full range of payment distributions to be compared more clearly. A random 5% sample of relevant records is used to reduce rendering time and computational load. The result is shown in Figure 3.
+
+The violin plot combines a mirrored density plot to illustrate how payment amounts are distributed across different ranges. Wider sections represent higher concentration of payments (greater density), while narrower areas indicate more dispersed payments (lower density). This visualization highlights not only the typical payment levels but also the spread and shape of the underlying distribution for each payment type.
+
+```{r, echo=FALSE, fig.width=10, fig.height=5, warning=FALSE, message=FALSE}
+library(dplyr)
+library(ggplot2)
+library(scales)
+
+# Identify bottom 4 payment types by total payment
+totals <- tapply(payments$Total_Payment_Amount, payments$Payment_Type, sum)
+bottom4_types <- names(sort(totals, decreasing = FALSE)[1:4])
+
+# Sample 5% of relevant data to reduce rendering time
+set.seed(123)
+sample_open <- payments %>%
+  filter(Payment_Type %in% bottom4_types) %>%
+  sample_frac(0.05)
+
+# Create violin plot with log-scaled y-axis but readable dollar labels
+ggplot(sample_open, aes(x = Payment_Type, y = Total_Payment_Amount, fill = Payment_Type)) +
+  geom_violin(scale = "width") +
+  scale_y_log10(labels = label_dollar()) +   # log scale, labels in actual $
+  scale_x_discrete(labels = c(
+    "Compensation For Services Other Than Consulting, Including Serving As Faculty Or As A Speaker At A Venue Other Than A Continuing Education Program" = "Other Comp"
+  )) +
+  labs(title = "Fig 3. Violin Plot of Payments by Bottom 4 Payment Types (Log Scale, Sampled 5%)",
+       x = "Payment Type",
+       y = "Payment Amount (USD, log scale)") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.title = element_text(hjust = 0.5))
+
+```
+
+The violin plot reveals distinct distribution patterns for each category after log transformation. Charitable Contribution shows a slightly wider distribution around 80 USD, then narrows around 500 USD, and expands again into a prominent bulge near 10,000 USD, indicating that most payments concentrate at higher values despite some payments being relatively small. Debt Forgiveness exhibits a gourd-shaped distribution, with noticeable peaks around 25 USD and 1,800 USD, followed by a narrowing above 10,000 USD, suggesting two dominant tiers of debt forgiveness payments: one smaller and more common, and one higher but less frequent. Entertainment and Gift payments both display their widest distributions around 20 to 150 USD, with much narrower density elsewhere, implying that most payments for these types cluster in the lower-to-mid range with few extreme values. Therefore, even among the least common payment types, each category demonstrates its own characteristic distribution, emphasizing the diversity of mechanisms and incentives pharmaceutical companies can offer to physicians.
+
+# 4 Payment–Prescription Relationship Analysis
+
+This section explores the relationship between pharmaceutical payments and physicians' prescription behavior. We first study the general correlation between physicians' number of patients and cost of prescribed drugs, and proceed to analyze how different payments methods and amounts influence prescription behaviors of physicians from various specialties.
+
+## 4.1 Total Drug Cost vs. Number of Beneficiaries
+
+We first establish a key driver of prescription costs: patient load. This plot shows the relationship between the number of beneficiaries served by physicians and the average total prescription cost within each bin of beneficiary counts. Physicians were grouped into bins of 10 patients each (up to 1,000 patients), and each bar represents the average total drug cost for the particular bin. This visualization provides an intuitive understanding of the overall trend without being overwhelmed by the large number of individual physicians.
+
+```{r, echo=FALSE, fig.width=10, fig.height=6, warning =FALSE}
+
+options(scipen=999)
+
+# Filter extreme outliers for clarity
+filtered_data <- subset(final_data, Number_of_Beneficiaries <= 1000)
+
+# Define bins
+bin_width <- 10
+bins <- cut(filtered_data$Number_of_Beneficiaries,
+            breaks = seq(0, max(filtered_data$Number_of_Beneficiaries, na.rm=TRUE), by=bin_width),
+            include.lowest = TRUE)
+
+# Compute average total drug cost per bin
+avg_total_cost <- tapply(filtered_data$Total_Drug_Cost, bins, mean, na.rm=TRUE)
+
+# Extract bin centers for plotting
+bin_centers <- as.numeric(sub("\\((.+),.*", "\\1", names(avg_total_cost))) + bin_width/2
+
+# Remove NA values
+valid_idx <- !is.na(avg_total_cost)
+
+# Plot
+plot(bin_centers[valid_idx],
+     avg_total_cost[valid_idx],
+     pch=16, col="blue",
+     xlab="Number of Beneficiaries (binned)",
+     ylab="Average Total Drug Cost (USD)",
+     main="Fig 4. Average Total Drug Cost vs Number of Beneficiaries")
+
+lines(bin_centers[valid_idx],
+      avg_total_cost[valid_idx],
+      col="red", lwd=2)
+
+```
+
+The plot shows a clear upward trend:bins with more beneficiaries generally have higher average total drug costs. This pattern provides conclusive evidence as to why the number of beneficiaries is included as a control variable in our subsequent regression analysis. By accounting for patient load, we can isolate the effect of pharmaceutical payments on total prescription costs, ensuring that observed differences are not merely due to some physicians having more patients.
+
+## 4.2 Average Total Drug Cost vs. Primary Specialty
+
+We next investigate another major potential driver of prescription costs: the physician's medical specialty. Figure 5 illustrates the variation in average total prescription costs across different physician specialties. After filtering out extreme outliers (top 1% of total drug costs), we calculated the mean total drug cost for each specialty and plotted the results as a scatter plot with a connecting line to visualize the trend.
+
+```{r, echo=FALSE, fig.width=10, fig.height=8, warning =FALSE}
+
+options(scipen=999)
+par(mar = c(17, 5, 4, 2) + 0.1)
+
+# Filter extreme outliers for clarity (top 1%), ignoring NA
+filtered_data <- subset(final_data, Total_Drug_Cost <= quantile(final_data$Total_Drug_Cost, 0.99, na.rm = TRUE))
+
+# Compute average total drug cost per specialty
+avg_total_cost <- tapply(filtered_data$Total_Drug_Cost, filtered_data$Primary_Specialty, mean, na.rm=TRUE)
+
+# Extract specialties and their averages
+specialties <- names(avg_total_cost)
+avg_costs <- as.numeric(avg_total_cost)
+
+# Plot average total drug cost per specialty without x-axis labels
+plot(1:length(avg_costs),
+     avg_costs,
+     pch=16, col="darkgreen",
+     xaxt="n",
+     xlab="",
+     ylab="Average Total Drug Cost (USD)",
+     main="Fig 5. Average Total Drug Cost vs Primary Specialty",
+     cex.lab = 1.2,
+     cex.main = 1.3)
+
+# Add x-axis labels with smaller font and vertical orientation
+axis(1, at=1:length(specialties), labels=specialties, las=2, cex.axis=0.7)  
+
+# Add a line connecting the points
+lines(1:length(avg_costs), avg_costs, col="darkblue", lwd=2)
+
+```
+
+The scatter plot reveals substantial variation in average total drug costs across physician specialties, which emphasizes the structural differences in prescribing behavior across specialties. It is evident that some specialties have much higher average costs than others, while some remain at moderate or relatively low levels. This pronounced variation suggests that specialty is an important determinant of total prescription costs.
+
+Given the substantial variation in average total drug costs across specialties, a natural question arises: are physicians with higher total drug costs primarily in specialties that inherently prescribe more expensive drugs, or are their costs mainly influenced by the number of patients they serve or the payments they receive? To address this, we include primary specialty as a control variable in our regression models. This allows us to account for structural differences across specialties while isolating the effects of other factors on total drug costs.
+
+Additionally, a text mining technique is implemented to tokenize the physicians' primary specialties and identify if certain keywords in the specialty corresponds to higher average payment received by each physician or total payment. Figures 6 and 7 visualize the text mining results by displaying the top ten specialty keywords for the average and total amounts. 
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(tidytext)
+
+tokens <- filtered_data %>%
+  select(Primary_Specialty, Total_Payment) %>%
+  unnest_tokens(word, Primary_Specialty) %>% # creates columns: word, Total_Payment
+  anti_join(stop_words, by = "word")  
+
+word_stats <- tokens %>%
+  group_by(word) %>%
+  summarise(
+    freq = n(),
+    avg_total = mean(Total_Payment, na.rm = TRUE)
+  ) %>%
+  filter(freq > 100) %>%
+  arrange(desc(avg_total)) %>%
+  mutate(avg_total = avg_total / 1e3)
+
+library(ggplot2)
+
+word_stats %>%
+  arrange(desc(avg_total)) %>%
+  slice_head(n = 10) %>%
+  ggplot(aes(x = reorder(word, avg_total), y = avg_total)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(
+    title = "Fig 6. Top Specialty Keywords by Average Payment",
+    x = "Specialty Keyword",
+    y = "Average Payment (Thousand USD)"
+  ) +
+  theme_minimal(base_size = 12) + 
+  theme(
+    plot.title = element_text(size = 10, face = "bold") 
+  )
+
+```
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+tokens <- filtered_data %>%
+  select(Primary_Specialty, Total_Payment) %>%
+  unnest_tokens(word, Primary_Specialty) %>%
+  anti_join(stop_words, by = "word")  
+
+word_stats_total <- tokens %>%
+  group_by(word) %>%
+  summarise(
+    freq = n(),
+    total_payments = sum(Total_Payment, na.rm = TRUE)
+  ) %>%
+  filter(freq > 100) %>%
+  arrange(desc(total_payments)) %>%
+  mutate(total_payments = total_payments / 1e6)
+
+library(ggplot2)
+
+word_stats_total %>%
+  arrange(desc(total_payments)) %>%
+  slice_head(n = 10) %>%
+  ggplot(aes(x = reorder(word, total_payments), y = total_payments)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(
+    title = "Fig 7. Top Specialty Keywords by Total Payments",
+    x = "Specialty Keyword",
+    y = "Total Payments (Million USD)"
+  ) +
+  theme_minimal(base_size = 12) + 
+  theme(
+    plot.title = element_text(size = 10, face = "bold") 
+  )
+```
+
+Unsurprisingly, physicians whose specialties are associated with large patient payments, including care for the head-neck area, spinal treatment, and orthopedic and reconstructive therapy, receive larger payments on average. Consistent with this result, the total payments received are higher for physicians who specialize in treatments or conditions affiliated with significant ailments, such as surgery, internal treatments, neurology, and oncology. Intriguingly, psychiatrists also received much payments from pharmaceutical companies, despite their service usually not inflicting large lump-sum costs. The authors suspect this is due to the substantial profiting opportunity from the patients' inelastic demand for expensive psychiatric medicine, which pushed the pharmaceutical companies' payments to physicians higher in order to benefit from more prescriptions.  
+
+## 4.3 Total Drug Cost & Payment Types
+
+To facilitate recognizing independent variables in our linear model, we use a correlation heatmap (Figure 8) to obtain a systematic overview of the relationships between the key variables. This plot shows the correlation between total payments, prescription metrics (including total drug cost, number of prescriptions, and total number of beneficiaries), and the top four payment types. It serves two purposes: first, to provide a preliminary correlation overview for key variables and their relationship with prescribing behavior, which informs subsequent regression analysis; and second, to illustrate how different payment types relate to prescribing behavior, addressing our second research question.
+
+```{r, echo=FALSE, fig.width=8, fig.height=5, message=FALSE, warning=FALSE}
+
+library(reshape2)
+library(ggplot2)
+library(dplyr)
+library(scales)
+library(data.table)
+
+# Step 1: Prepare numeric data
+numeric_vars <- final_data %>% 
+  dplyr::select(Total_Payment, Total_Drug_Cost, Prescription_Count, Number_of_Beneficiaries)
+
+# Step 2: Identify top 4 Payment_Types by total payment
+to_cleaned_name <- function(x) {
+  x <- gsub(" ", "_", x)
+  x <- gsub("-", "_", x)
+  x <- gsub("[^0-9A-Za-z_]", "", x)
+  x
+}
+
+top_types <- names(sort(tapply(payments$Total_Payment_Amount, payments$Payment_Type, sum), 
+                        decreasing = TRUE)[1:4])
+
+existing_cols <- to_cleaned_name(top_types)
+existing_cols <- existing_cols[existing_cols %in% colnames(final_data)]
+
+long_col <- "Compensation_for_services_other_than_consulting__including_serving_as_faculty_or_as_a_speaker_at_a_venue_other_than_a_continuing_education_program"
+if (!(long_col %in% existing_cols) && long_col %in% colnames(final_data)) {
+  existing_cols <- c(existing_cols, long_col)
+}
+
+setDT(final_data)
+numeric_vars <- cbind(
+  numeric_vars,
+  final_data[, ..existing_cols]
+)
+
+# Step 3: Compute correlation
+cor_mat <- cor(numeric_vars, use = "complete.obs")
+cor_df <- melt(cor_mat)
+
+cor_df$Var1 <- as.character(cor_df$Var1)
+cor_df$Var2 <- as.character(cor_df$Var2)
+
+# Step 4: Relabel long Payment_Type
+change_name <- function(text) {
+  if (grepl("^Compensation_for_services_other_than_consulting", text, ignore.case = TRUE)) {
+    return("Non-consulting_services")
+  } else {
+    return(text)
+  }
+}
+
+cor_df$Var1 <- sapply(cor_df$Var1, change_name)
+cor_df$Var2 <- sapply(cor_df$Var2, change_name)
+
+# Step 5: Plot heatmap
+ggplot(cor_df, aes(Var1, Var2, fill = value)) +
+  geom_tile() +
+  geom_text(aes(label = round(value, 2)), color = "black") +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Fig 8. Correlation Heatmap of Payments and Prescription Metrics",
+       x = "", y = "", fill = "Correlation")
+
+```
+
+The heatmap shows several intriguing characteristics. First, we observe a moderate correlation between total drug cost and the number of beneficiaries, with a correlation coefficient exceeding 0.5. This justifies including the number of beneficiaries as a control variable in the regression analysis. Secondly, the correlation between total payment amount and payments associated with royalty or license is 0.95, a significantly large value. This comes as no surprise, as royalty or license-related payments is the leading payment method, as seen in the previous box plot analysis. Lastly, while most correlation coefficients between payment methods and prescription or patient counts are insignificant (mostly below 0.2), the correlation between total drug cost and food and beverage cost is non-negligible at 0.27. In contrast, the correlation between total payments and total drug cost is very small (0.02). Interestingly, in the subsequent linear regression model, total payments are found to have a statistically significant effect on total drug cost. This suggests that controlling for variables such as the number of beneficiaries and the primary specialty helps reveal the true impact of payments, which is not apparent from the simple correlation alone.
+
+## 4.4. Total Payment vs Total Drug Cost
+
+Finally, we visually examine the unadjusted relationship between a physician's total received payments and their total prescription costs. Figure 9 explores the relationship between total pharmaceutical payments and total prescription drug costs per physician. To maintain interpretability and reduce visual noise, 0.3% of the data is displayed as scatter points. A LOESS curve, fitted on a 5% random sample, is overlaid to show a smooth and reliable trend. The analysis focuses on physicians whose total payments do not exceed \$5,000 to minimize the impact of extreme outliers. Both axes are displayed on a logarithmic scale to stabilize variance and compress extreme values, allowing clearer visualization of the relationship across different magnitudes.
+
+```{r, echo=FALSE, fig.width=12, fig.height=8, message=FALSE, warning=FALSE}
+
+library(ggplot2)
+library(dplyr)
+library(scales)
+
+set.seed(123)
+
+# Use a larger sample (5%) for fitting the LOESS curve to ensure a smooth trend
+fit_data <- final_data %>%
+  filter(!is.na(Total_Payment) & !is.na(Total_Drug_Cost)) %>%
+  sample_frac(0.05) %>%
+  filter(Total_Payment <= 5000)
+
+# Use a much smaller sample (0.3%) for displaying scatter points
+# This reduces visual noise while still showing the data distribution
+plot_data <- final_data %>%
+  filter(!is.na(Total_Payment) & !is.na(Total_Drug_Cost)) %>%
+  sample_frac(0.003) %>%
+  filter(Total_Payment <= 5000)
+
+ggplot() +
+  # Display a small fraction of green dots for readability
+  geom_point(data = plot_data, aes(x = Total_Payment, y = Total_Drug_Cost),
+             alpha = 0.3, color = "darkgreen") +
+  # Fit the LOESS smoothing line using more data for a more reliable trend
+  geom_smooth(data = fit_data, aes(x = Total_Payment, y = Total_Drug_Cost),
+              method = "loess", se = FALSE, color = "darkblue") +
+  # Apply logarithmic scales for better visualization of skewed distributions
+  scale_x_log10(labels = scales::comma) +
+  scale_y_log10(labels = scales::comma) +
+  # Add titles and labels
+  labs(title = "Fig 9. LOESS Plot (Log Scale): Total Payment vs Total Drug Cost",
+       subtitle = "Scatter sampled at 0.3%, LOESS fitted on 5%",
+       x = "Total Payment (log USD, truncated at 5000)",
+       y = "Total Drug Cost (log USD)") +
+  # Clean theme and centered titles
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5))
+
+```
+
+The plot suggests only a very subtle positive relationship between total payments and total drug costs, which is not immediately obvious: at first glance, it might seem that physicians receiving higher payments do not consistently write prescriptions with higher total costs. This is largely because the plot does not account for the number of beneficiaries or physicians’ primary specialties, both of which are strongly related to total drug costs. However, the subsequent regression model, which controls for the number of beneficiaries and primary specialties, reveals a statistically significant positive association between total payments and total prescription costs, consistent with economic expectations.
+
+## 4.5. Interactive "Killer Plot": Payment vs Drug Cost Body Heatmap
+
+To facilitate the readers' understanding, an interactive "killer plot" is created to demonstrate the payments received and costs of drugs prescribed by specialists for different body parts. For simplicity, the killer plot deconstructs the human body into the head/neck, the chest region, the abdomen region, and the extremities. Specialties are classified into the different parts according to the Table 2.
+
+```{r, echo=FALSE}
+library(tibble)
+library(knitr)
+
+spec_to_body <- tribble(
+  ~Primary_Specialty,     ~body_part,
+  "Neurology",            "Head",
+  "Ophthalmology",        "Head",
+  "Otorhinolaryngology",  "Head",
+  "Dermatology",          "Chest",
+  "Cardiology",           "Chest",
+  "Pulmonary Disease",    "Chest",
+  "Oncology",             "Chest",
+  "Gastroenterology",     "Abdomen",
+  "Endocrinology",        "Abdomen",
+  "Urology",              "Abdomen",
+  "Nephrology",           "Abdomen",
+  "Orthopedic Surgery",   "Extremities",
+  "Rheumatology",         "Extremities"
+)
+
+spec_to_body |>
+  dplyr::rename(
+    Specialty = Primary_Specialty,
+    `Body Part` = body_part
+  ) |>
+  knitr::kable(
+    caption = "Classification of Physician Specialties to Body Parts"
+  )
+```
+
+As shown below, the interactive plot examines total payments received and total drug costs prescribed for respective body parts at once, with the payments received on the left half and drugs prescribed on the right half. The colors for the body parts on each half are defined by separate heatmaps, with red indicating large amounts and yellow representing otherwise. To analyze the payments received, the user can select a subset of payment methods included in the calculation to gain insights into how different payment methods associate with physicians of different specialties. 
+
+In additional to the heatmap-characterized colors for the total costs of prescribed drugs, the transparency of respective body parts' colors indicate the average costs of drugs prescribed by each physician, with opaqueness indicating high average costs. The examples below display two static plots with number of beneficiaries at 800 (Figure 10) and 100 (Figure 11), respectively. It can be seen that, despite having equal numerical values, the right half of the first plot (number of beneficiaries = 800) is more opaque than the second, indicating higher costs of prescribed drug on average. This is unsurprising, as more patients generally corresponds to more drugs prescribed, leading to higher cost of drugs. To analyze the total costs of prescribed drugs, the user can select only physicians with some fixed number of beneficiaries in the calculation, revealing trends of whether serving more patients is correlated with increasing average cost of prescribed drugs.
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+library(dplyr)
+library(tibble)
+library(grid)
+
+# 1. SPECIALTY → BODY PART MAP
+spec_to_body <- tribble(
+  ~Primary_Specialty,     ~body_part,
+  "Neurology",            "Head",
+  "Ophthalmology",        "Head",
+  "Otorhinolaryngology",  "Head",
+  "Dermatology",          "Chest",
+  "Cardiology",           "Chest",
+  "Pulmonary Disease",    "Chest",
+  "Gastroenterology",     "Abdomen",
+  "Endocrinology",        "Abdomen",
+  "Urology",              "Abdomen",
+  "Nephrology",           "Abdomen",
+  "Orthopedic Surgery",   "ArmsLegs",
+  "Rheumatology",         "ArmsLegs",
+  "Oncology",             "Chest"
+)
+
+# 2. LOAD DATA
+df_real <- payments %>%
+  filter(Recipient_Type == "Covered Recipient Physician") %>%
+  mutate(Payment_Type = as.character(Payment_Type),
+         Primary_Specialty = as.character(Primary_Specialty)) %>%
+  inner_join(spec_to_body, by = "Primary_Specialty")
+
+df_drug <- final_data %>%
+  inner_join(spec_to_body, by = "Primary_Specialty") %>%
+  filter(Number_of_Beneficiaries <= 1000)
+
+# 3. HUMAN BODY POLYGONS
+body_shapes <- list(
+  Head = data.frame(
+    x = c(.45, .55, .60, .55, .45, .40),
+    y = c(.85, .85, .78, .70, .70, .78)
+  ),
+  Chest = data.frame(
+    x = c(.38, .62, .62, .38),
+    y = c(.70, .70, .55, .55)
+  ),
+  Abdomen = data.frame(
+    x = c(.40, .60, .60, .40),
+    y = c(.55, .55, .40, .40)
+  ),
+  ArmsLegs = data.frame(
+    x = c(.30, .70, .70, .55, .55, .45, .45, .30),
+    y = c(.40, .40, .15, .15, .05, .05, .15, .15)
+  )
+)
+
+# STATIC VERSION
+beneficiary_value <- 800
+
+# Compute payment data
+dat_pay <- df_real %>%
+  group_by(body_part) %>%
+  summarise(total = sum(Total_Payment_Amount), .groups = "drop")
+
+totals_pay <- setNames(as.numeric(dat_pay$total), dat_pay$body_part)
+
+# Compute drug data
+dat_drug <- df_drug %>%
+  group_by(body_part) %>%
+  summarise(total = sum(Total_Drug_Cost, na.rm = TRUE), .groups = "drop")
+
+totals_drug <- setNames(as.numeric(dat_drug$total), dat_drug$body_part)
+
+# Drug alpha (static)
+alpha <- {
+  n <- beneficiary_value
+  avg_cost <- df_drug %>%
+    filter(Number_of_Beneficiaries == n) %>%
+    summarise(avg = mean(Total_Drug_Cost, na.rm = TRUE)) %>%
+    pull(avg)
+  if(is.na(avg_cost)) avg_cost <- 0
+  max_avg <- df_drug %>%
+    group_by(Number_of_Beneficiaries) %>%
+    summarise(avg = mean(Total_Drug_Cost, na.rm = TRUE)) %>%
+    summarise(max_avg = max(avg, na.rm = TRUE)) %>%
+    pull(max_avg)
+  a <- 0.3 + 0.7 * (avg_cost / max_avg)
+  min(max(a,0),1)
+}
+
+# Normalize
+parts <- names(body_shapes)
+vals_pay <- totals_pay
+p_pay <- 0.3 + 0.7 * ((vals_pay - min(vals_pay)) / (max(vals_pay) - min(vals_pay)))
+
+vals_drug <- totals_drug
+p_drug <- 0.3 + 0.7 * ((vals_drug - min(vals_drug)) / (max(vals_drug) - min(vals_drug)))
+
+col_fun_pay <- function(body_name){
+  val <- totals_pay[body_name]
+  if(val==0) return("gray90")
+  idx <- which(names(totals_pay) == body_name)
+  rgb(1, 1 - p_pay[idx], 0)
+}
+
+col_fun_drug <- function(body_name){
+  val <- totals_drug[body_name]
+  if(val==0) return("gray90")
+  idx <- which(names(totals_drug) == body_name)
+  adjustcolor(rgb(1, 1 - p_drug[idx], 0), alpha.f = alpha)
+}
+
+# --- DRAW STATIC KILLER PLOT ---
+grid.newpage()
+pushViewport(plotViewport(margins = c(0.5,2,2,2)))
+
+grid.text(
+  "Fig 10. Static Killer plot (number of beneficiaries = 800)",
+  x = unit(0.5, "npc"),
+  y = unit(1, "npc") - unit(1, "lines"),   # slightly below top edge
+  gp = gpar(fontsize = 10, fontface = "bold")
+)
+
+for(part in parts){
+  poly <- body_shapes[[part]]
+  x_mid <- mean(poly$x)
+
+  # Left (Payment)
+  left_poly <- poly
+  left_poly$x[left_poly$x > x_mid] <- x_mid
+  grid.polygon(
+    x = left_poly$x, y = left_poly$y,
+    default.units = "npc",
+    gp = gpar(fill = col_fun_pay(part), col = "black", lwd = 1.5)
+  )
+  grid.text(
+    label = paste0("$", format(round(totals_pay[part],0), big.mark=",")),
+    x = mean(left_poly$x - 0.06), y = mean(left_poly$y),
+    gp = gpar(col = "black", cex = 0.7)
+  )
+
+  # Right (Drug Cost)
+  right_poly <- poly
+  right_poly$x[right_poly$x < x_mid] <- x_mid
+  grid.polygon(
+    x = right_poly$x, y = right_poly$y,
+    default.units = "npc",
+    gp = gpar(fill = col_fun_drug(part), col = "black", lwd = 1.5)
+  )
+  grid.text(
+    label = paste0("$", format(round(totals_drug[part],0), big.mark=",")),
+    x = mean(right_poly$x + 0.06), y = mean(right_poly$y),
+    gp = gpar(col = "black", cex = 0.7)
+  )
+}
+
+```
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+library(dplyr)
+library(tibble)
+library(grid)
+
+# 1. SPECIALTY → BODY PART MAP
+spec_to_body <- tribble(
+  ~Primary_Specialty,     ~body_part,
+  "Neurology",            "Head",
+  "Ophthalmology",        "Head",
+  "Otorhinolaryngology",  "Head",
+  "Dermatology",          "Chest",
+  "Cardiology",           "Chest",
+  "Pulmonary Disease",    "Chest",
+  "Gastroenterology",     "Abdomen",
+  "Endocrinology",        "Abdomen",
+  "Urology",              "Abdomen",
+  "Nephrology",           "Abdomen",
+  "Orthopedic Surgery",   "ArmsLegs",
+  "Rheumatology",         "ArmsLegs",
+  "Oncology",             "Chest"
+)
+
+# 2. LOAD DATA
+df_real <- payments %>%
+  filter(Recipient_Type == "Covered Recipient Physician") %>%
+  mutate(Payment_Type = as.character(Payment_Type),
+         Primary_Specialty = as.character(Primary_Specialty)) %>%
+  inner_join(spec_to_body, by = "Primary_Specialty")
+
+df_drug <- final_data %>%
+  inner_join(spec_to_body, by = "Primary_Specialty") %>%
+  filter(Number_of_Beneficiaries <= 1000)
+
+# 3. HUMAN BODY POLYGONS
+body_shapes <- list(
+  Head = data.frame(
+    x = c(.45, .55, .60, .55, .45, .40),
+    y = c(.85, .85, .78, .70, .70, .78)
+  ),
+  Chest = data.frame(
+    x = c(.38, .62, .62, .38),
+    y = c(.70, .70, .55, .55)
+  ),
+  Abdomen = data.frame(
+    x = c(.40, .60, .60, .40),
+    y = c(.55, .55, .40, .40)
+  ),
+  ArmsLegs = data.frame(
+    x = c(.30, .70, .70, .55, .55, .45, .45, .30),
+    y = c(.40, .40, .15, .15, .05, .05, .15, .15)
+  )
+)
+
+# STATIC VERSION
+beneficiary_value <- 100
+
+# Compute payment data
+dat_pay <- df_real %>%
+  group_by(body_part) %>%
+  summarise(total = sum(Total_Payment_Amount), .groups = "drop")
+
+totals_pay <- setNames(as.numeric(dat_pay$total), dat_pay$body_part)
+
+# Compute drug data
+dat_drug <- df_drug %>%
+  group_by(body_part) %>%
+  summarise(total = sum(Total_Drug_Cost, na.rm = TRUE), .groups = "drop")
+
+totals_drug <- setNames(as.numeric(dat_drug$total), dat_drug$body_part)
+
+# Drug alpha (static)
+alpha <- {
+  n <- beneficiary_value
+  avg_cost <- df_drug %>%
+    filter(Number_of_Beneficiaries == n) %>%
+    summarise(avg = mean(Total_Drug_Cost, na.rm = TRUE)) %>%
+    pull(avg)
+  if(is.na(avg_cost)) avg_cost <- 0
+  max_avg <- df_drug %>%
+    group_by(Number_of_Beneficiaries) %>%
+    summarise(avg = mean(Total_Drug_Cost, na.rm = TRUE)) %>%
+    summarise(max_avg = max(avg, na.rm = TRUE)) %>%
+    pull(max_avg)
+  a <- 0.3 + 0.7 * (avg_cost / max_avg)
+  min(max(a,0),1)
+}
+
+# Normalize
+parts <- names(body_shapes)
+vals_pay <- totals_pay
+p_pay <- 0.3 + 0.7 * ((vals_pay - min(vals_pay)) / (max(vals_pay) - min(vals_pay)))
+
+vals_drug <- totals_drug
+p_drug <- 0.3 + 0.7 * ((vals_drug - min(vals_drug)) / (max(vals_drug) - min(vals_drug)))
+
+col_fun_pay <- function(body_name){
+  val <- totals_pay[body_name]
+  if(val==0) return("gray90")
+  idx <- which(names(totals_pay) == body_name)
+  rgb(1, 1 - p_pay[idx], 0)
+}
+
+col_fun_drug <- function(body_name){
+  val <- totals_drug[body_name]
+  if(val==0) return("gray90")
+  idx <- which(names(totals_drug) == body_name)
+  adjustcolor(rgb(1, 1 - p_drug[idx], 0), alpha.f = alpha)
+}
+
+# --- DRAW STATIC KILLER PLOT ---
+grid.newpage()
+pushViewport(plotViewport(margins = c(0.5,2,2,2)))
+
+grid.text(
+  "Fig 11. Static Killer plot (number of beneficiaries = 100)",
+  x = unit(0.5, "npc"),
+  y = unit(1, "npc") - unit(1, "lines"),   # slightly below top edge
+  gp = gpar(fontsize = 10, fontface = "bold")
+)
+
+for(part in parts){
+  poly <- body_shapes[[part]]
+  x_mid <- mean(poly$x)
+
+  # Left (Payment)
+  left_poly <- poly
+  left_poly$x[left_poly$x > x_mid] <- x_mid
+  grid.polygon(
+    x = left_poly$x, y = left_poly$y,
+    default.units = "npc",
+    gp = gpar(fill = col_fun_pay(part), col = "black", lwd = 1.5)
+  )
+  grid.text(
+    label = paste0("$", format(round(totals_pay[part],0), big.mark=",")),
+    x = mean(left_poly$x - 0.06), y = mean(left_poly$y),
+    gp = gpar(col = "black", cex = 0.7)
+  )
+
+  # Right (Drug Cost)
+  right_poly <- poly
+  right_poly$x[right_poly$x < x_mid] <- x_mid
+  grid.polygon(
+    x = right_poly$x, y = right_poly$y,
+    default.units = "npc",
+    gp = gpar(fill = col_fun_drug(part), col = "black", lwd = 1.5)
+  )
+  grid.text(
+    label = paste0("$", format(round(totals_drug[part],0), big.mark=",")),
+    x = mean(right_poly$x + 0.06), y = mean(right_poly$y),
+    gp = gpar(col = "black", cex = 0.7)
+  )
+}
+
+```
+
+# 5 Statistical Modeling
+
+Building on the insights from the exploratory analysis, we now proceed to construct a linear regression model to formally quantify the relationships between payments and prescribing behavior.
+
+## 5.1 Rudimentary Model
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE, results='hide'}
+options(scipen=0)
+
+#Construct the model
+model <- lm(log(Total_Drug_Cost + 1) ~ log(Total_Payment + 1) + Number_of_Beneficiaries,
+            data = final_data)
+
+#Summarize regression results
+summary(model)
+```
+
+The primary goal of this model is to examine the relationship between the total monetary value of pharmaceutical payments that physicians receive and the overall cost of prescriptions they write. By understanding this relationship, we aim to explore whether financial incentives from pharmaceutical companies systematically influence prescribing behavior under Medicare Part D.
+
+We construct a linear regression model using log-transformed variables because both total payments from pharmaceutical companies and total prescription cost are highly skewed, with a few physicians receiving very large payments or writing very costly prescriptions. Log transformation stabilizes variance, reduces the influence of extreme values and the variables' large kurtosis, and improves interpretability. Specifically, the dependent variable is log-transformed total prescription cost, and the key independent variable is log-transformed total payments from pharmaceutical companies. We also control for the number of patients each physician serves, as physicians with more patients are naturally likely to write more prescriptions. The model can be expressed as:
+
+$$
+\log(\text{Total\_Drug\_Cost} + 1) = \beta_0 + \beta_1 \log(\text{Total\_Payment} + 1) + \beta_2 \text{Number\_of\_Beneficiaries} + \epsilon
+$$
+
+By including number of patients as a control, we ensure that the effect of total payments from pharmaceutical companies on total prescription cost is not confounded by differences in patient load.
+
+The regression results show that:
+
+-   The coefficient for log-transformed total payments from pharmaceutical companies is 0.375 (p \< 2e-16), indicating a positive and statistically significant association. This means that, holding the number of beneficiaries constant, physicians who receive higher pharmaceutical payments tend to prescribe drugs with higher total costs.
+
+-   The coefficient for number of patients is 0.0003428 (p \< 2e-16), also significant, reflecting the expected increase in prescription cost as patient load increases.
+
+-   The model's R-squared is 0.079, suggesting that approximately 7.9% of the variation in log-transformed drug costs is explained by payments and patient load. While modest, this is meaningful given the complexity of prescribing behavior and the many unobserved factors influencing it.
+
+## 5.2 Follow-up Model
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE, results='hide'}
+
+options(scipen=0)
+
+followup_model <- lm(
+log(Total_Drug_Cost + 1) ~ log(Total_Payment + 1) + Number_of_Beneficiaries + Primary_Specialty,
+data = final_data
+)
+
+summary(followup_model)
+
+```
+
+The follow-up model extends the main model by including the primary specialty as a categorical control variable. This allows us to examine whether the association between total pharmaceutical payments and prescription costs holds after accounting for differences in medical specialty, since certain specialties naturally prescribe more expensive drugs.
+
+We construct a linear regression model using log-transformed variables because both total payments from pharmaceutical companies and total prescription cost are highly skewed, with a few physicians receiving very large payments or writing very costly prescriptions. Log transformation stabilizes variance, reduces the influence of extreme values, and improves interpretability. Specifically, the dependent variable is the logarithm of total drug cost, and the key independent variable is the logarithm of total payments from pharmaceutical companies. We also control for the number of patients each physician serves, as physicians with more patients are naturally likely to write more prescriptions. In addition, we control for the physician's primary specialty to account for differences in prescribing patterns across specialties. The model can be expressed as:
+
+$$
+\log(\text{Total\_Drug\_Cost} + 1) = \beta_0 + \beta_1 \log(\text{Total\_Payment} + 1) + \beta_2 \text{Number\_of\_Beneficiaries} + \beta_3 \text{Primary\_Specialty} + \epsilon
+$$
+
+By including the primary specialty as an additional control, we account for differences in prescribing behavior across medical specialties, ensuring that the estimated effect of pharmaceutical payments on total prescription costs is not confounded by specialty-specific patterns.
+
+The regression results show that:
+
+-   The coefficient for log-transformed total payments from pharmaceutical companies decreases to 0.2063 (p \< 2e-16) but remains positive and statistically significant. This indicates that, holding both patient load and specialty constant, physicians who receive higher pharmaceutical payments tend to prescribe drugs with higher total costs.
+
+-   The coefficient for number of beneficiaries decreases slightly to 0.0001951 (p \< 2e-16), still significant, reflecting that prescription costs increase with patient load.
+
+-   Many primary specialty categories have significant coefficients, indicating that specialty-specific factors substantially influence prescription costs.
+
+-   The model's R-squared increases to 0.617, suggesting that including specialty explains a large portion of variation in log-transformed drug costs. This is a substantial improvement over the previous model, highlighting the importance of specialty in prescribing behavior.
+
+# 6 Conclusion
+
+This analysis establishes a statistically significant, positive relationship between the total value of pharmaceutical industry payments to physicians and the aggregate cost of prescriptions they write under Medicare Part D. Crucially, this association persists after rigorously controlling for both patient volume and physician specialty, the latter accounting for a substantial portion of the observed variation in prescribing costs. The findings suggest that financial incentives, even of modest value, are correlated with physician prescribing behavior in a manner that increases overall drug expenditures.
+
+These results highlight the need for continued transparency and scrutiny of industry-physician relationships. Future research should build upon these findings by investigating the specific mechanisms through which payments influence behavior. A critical next step is to analyze whether payments are associated with a higher rate of brand-name drug prescriptions relative to therapeutically equivalent generics. Furthermore, employing longitudinal designs to track prescribing patterns before and after physicians begin receiving payments would strengthen causal inference. Finally, expanding the scope to evaluate impacts on prescribing appropriateness and patient health outcomes would provide a more complete understanding of the clinical and ethical ramifications of these financial ties.
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE, results='hide'}
+#Disconnect sqlite
+dbDisconnect(con)
+```
+
+# References
+
+1. Centers for Medicare and Medicaid Services. https://www.cms.gov/data-research/statistics-trends-and-reports/national-health-expenditure-data/nhe-fact-sheet?utm_source=chatgpt.com. Retrieved on November 25, 2025.
+
+2. OECD. (2023). Health at a Glance 2023: OECD Indicators. OECD Publishing, Paris, https://doi.org/10.1787/7a7afb35-en.
+
+# Appendix
+
+## Data Preprocessing
+
+To prepare the data for analysis, several preprocessing steps are implemented:
+
+1.  **Variable Cleaning:**
+
+    -   **Purpose:** Ensure that key identifiers and categorical variables are consistent and valid.
+
+        -   **Physician Identifier (NPI)**
+
+            -   Convert to character type to preserve leading zeros.
+
+            -   Remove missing or invalid NPIs.
+
+            -   Pad NPIs to 10 digits if necessary.
+
+        -   **Recipient Type Filtering**
+
+            -   Keep only individual physicians.
+
+            -   Remove hospitals, organizations, or other non-physician entities.
+
+        -   **Payment Type Formatting**
+
+            -   Remove leading and trailing spaces.
+
+            -   Standardize capitalization for consistency.
+
+        -   **Payment Amounts**
+
+            -   Remove records where Total_Payment_Amount is NA.
+
+            -   Remove negative payment amounts, which are invalid in this context.
+
+        -   **Primary Specialty**
+
+            -   Extracted from `Covered_Recipient_Specialty_1`.
+
+            -   Capture the last segment after the '\|' delimiter, representing the physician's main specialty.
+
+SQL Queries:
+
+``` sql
+CREATE TEMP TABLE cleaned_payments AS
+SELECT
+    -- Standardize NPI as 10-character string to preserve leading zeros
+    printf('%010s', TRIM(Covered_Recipient_NPI)) AS NPI,
+    
+    -- Convert payment amount to numeric
+    CAST(Total_Amount_of_Payment_USDollars AS REAL) AS Total_Payment_Amount,
+    
+    -- Standardize payment type: capitalize first letter, lowercase the rest
+    TRIM(
+        UPPER(SUBSTR(Nature_of_Payment_or_Transfer_of_Value, 1, 1)) ||
+        LOWER(SUBSTR(Nature_of_Payment_or_Transfer_of_Value, 2))
+    ) AS Payment_Type,
+    
+    -- Keep the original recipient type
+    Covered_Recipient_Type AS Recipient_Type,
+    
+    -- Extract primary specialty: take last segment after '|' delimiter
+    TRIM(
+        CASE
+            WHEN INSTR(Covered_Recipient_Specialty_1, '|') = 0 THEN Covered_Recipient_Specialty_1
+            ELSE SUBSTR(
+                     Covered_Recipient_Specialty_1,
+                     LENGTH(Covered_Recipient_Specialty_1) - INSTR(
+                     REVERSE(Covered_Recipient_Specialty_1), '|') + 2
+                 )
+        END
+    ) AS Primary_Specialty
+FROM pharmaceutical_payment_table
+WHERE Covered_Recipient_NPI IS NOT NULL
+  AND Covered_Recipient_NPI != ''
+  AND Covered_Recipient_Type = 'Covered Recipient Physician'
+  AND Total_Amount_of_Payment_USDollars IS NOT NULL
+  AND Total_Amount_of_Payment_USDollars >= 0;
+```
+
+2.  **Payment Aggregation and Type Breakdown:**
+
+    -   **Purpose:** Summarize payments at the physician level for regression analysis.
+
+        -   Aggregate total payments per physician.
+
+        -   Create separate columns for each payment type.
+
+SQL Queries:
+
+``` sql
+CREATE TEMP TABLE doctor_level AS
+SELECT
+    NPI,
+    
+    -- Keep recipient type and primary specialty (max just to keep one per NPI)
+    MAX(Recipient_Type) AS Recipient_Type,
+    MAX(Primary_Specialty) AS Primary_Specialty,
+    
+    -- Aggregate total payments per physician
+    SUM(Total_Payment_Amount) AS Total_Payment,
+    
+    -- Aggregate payments by type (example for 4 common types)
+    -- Note: This part is dynamically generated for all distinct Payment_Type values using R
+    SUM(CASE WHEN Payment_Type = 'Consulting fee' THEN Total_Payment_Amount ELSE 0 END) 
+    AS Consulting_fee,
+    SUM(CASE WHEN Payment_Type = 'Food and beverage' THEN Total_Payment_Amount ELSE 0 END) 
+    AS Food_and_beverage,
+    SUM(CASE WHEN Payment_Type = 'Non-consulting services' THEN Total_Payment_Amount ELSE 0 END) 
+    AS Non_consulting_services,
+    SUM(CASE WHEN Payment_Type = 'Royalty or license' THEN Total_Payment_Amount ELSE 0 END) 
+    AS Royalty_or_license
+
+FROM cleaned_payments
+GROUP BY NPI;
+```
+
+3.  **Merging Datasets:**
+
+    -   **Purpose:** Combine physician payment information with prescription activity.
+
+    -   **Question:** How are the Physician Identifier (NPI) columns in the primary and secondary datasets formatted and named, and what operations must be performed to ensure that the merged dataset correctly matches the physicians prescription activities to the payments they received?
+
+    -   **Solution:** The NPI column is named "Covered_Recipient_NPI" in the primary dataset and "PRSCRBR_NPI" in the secondary dataset. We rename both columns to "NPI", and then set their each NPI entry's to character before removing all rows with NA values. We then merge the two datasets, ensuring the same physician's activities are matched and there are no NA values in columns we are interested in.
+
+SQL Queries:
+
+``` sql
+CREATE TEMP TABLE cleaned_prescribing AS
+SELECT
+    -- Standardize NPI
+    printf('%010s', TRIM(PRSCRBR_NPI)) AS NPI,
+    
+    -- Convert prescription metrics to numeric
+    CAST(Tot_30day_Fills AS REAL) AS Prescription_Count,
+    CAST(Tot_Drug_Cst AS REAL) AS Total_Drug_Cost,
+    CAST(Tot_Benes AS REAL) AS Number_of_Beneficiaries
+FROM prescribing_behavior_table
+WHERE PRSCRBR_NPI IS NOT NULL
+  AND PRSCRBR_NPI != ''
+  AND Tot_30day_Fills IS NOT NULL
+  AND Tot_Drug_Cst IS NOT NULL
+  AND Tot_Benes IS NOT NULL;
+
+-- Merge doctor-level payments with prescribing behavior
+CREATE TABLE final_data AS
+SELECT 
+    d.*,
+    c.Prescription_Count,
+    c.Total_Drug_Cost,
+    c.Number_of_Beneficiaries
+FROM doctor_level d
+LEFT JOIN cleaned_prescribing c
+ON d.NPI = c.NPI;
+```
