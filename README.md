@@ -1,5 +1,5 @@
 # Pharmaceutical-Payments-Analysis
-Pharmaceutical Payments and Physician Prescribing Behavior in the United States
+Pharmaceutical Payments & Physician Prescribing Behavior in the United States
 
 The United States healthcare system is characterized by expenditures that significantly exceed those of other
 developed nations. In 2023, healthcare spending accounted for 17.6% of the US GDP1, a proportion that is
@@ -53,7 +53,6 @@ speaking honoraria).
 • Physician Identifier (NPI): Unique identifier for each physician, enabling linkage with prescribing data.
 • Primary Specialty (categorical): The main clinical specialty of the physician. This variable allows
 controlling for inherent differences in prescribing patterns across specialties.
-
 
 Secondary Dataset: Medicare Part D Prescribers by Provider 2023
 Source: CMS Medicare Part D Prescriber Public Use File (https://data.cms.gov/provider-summary-bytype-of-service/medicare-part-d-prescribers/medicare-part-d-prescribers-by-provider)
